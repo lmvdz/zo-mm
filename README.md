@@ -52,3 +52,7 @@ MAX_GAIN=0.25
 ### Running
 
 `yarn start`
+
+![image](https://user-images.githubusercontent.com/2179775/167247190-00387c13-f40c-4368-86dc-2e9107a7a16e.png)
+![image](https://user-images.githubusercontent.com/2179775/167247194-69d451c4-9155-4b79-bd82-5acf02d012c0.png)
+
