@@ -56,13 +56,6 @@ try {
 }
 const botWallet = new Wallet(keypair);
 
-(async () => {
-
-    
-
-
-})();
-
 
 interface Order {
     orderId: anchor.BN;
