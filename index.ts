@@ -78,6 +78,7 @@ const MAX_GAIN = process.env.MAX_GAIN || 0.25;
 const CANCEL_ORDER_INTERVAL_SECONDS = Number.parseFloat(process.env.CANCEL_ORDER_INTERVAL_SECONDS) || 1;
 const MARKET_REBALANCE_TIMEOUT_SECONDS = Number.parseFloat(process.env.MARKET_REBALANCE_TIMEOUT_SECONDS) || 2;
 const SPREAD_PERCENTAGE = Number.parseFloat(process.env.MM_SPREAD_PERCENTAGE) || 0.1
+
 interface Order {
     orderId: anchor.BN;
     controlAddress: PublicKey;
@@ -121,7 +122,6 @@ class MarketMaker {
         this.program = program;
         this.state = state;
         this.margin = margin;
-        this.running = false;
 
         this.spreads = {}
         this.midPrices = new Map<string, number>();
@@ -199,7 +199,7 @@ class MarketMaker {
         this.margin.loadOrders();
         // loop over markets
         [...this.markets.keys()].forEach((market, index) => {
-            console.log(market);
+            console.log('rebalancing market '+ market);
             setTimeout(async () => {
                 // get the market maker's orders
                 const orders = await this.loadMarketMakerOrdersForMarket(market)
@@ -235,7 +235,7 @@ class MarketMaker {
                             console.error(error);
                         }
                     } else {
-                        console.log(positionInfo.marketKey, pnl)
+                        console.log('current position ' + positionInfo.marketKey + ' pnl ' + pnl.toFixed(4));
                     }
                 }
                 // open orders using tardis based mark price as mid price
@@ -345,8 +345,6 @@ const rebalanceIntervalInSeconds = Number.parseFloat(process.env.REBALANCE_INTER
 
 
 MarketMaker.load().then(marketMaker => {
-    
-    console.log(ACTIVE_MARKETS);
 
     // load markets
     Promise.allSettled(ACTIVE_MARKETS.map(async marketToMake => {
