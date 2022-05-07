@@ -1,0 +1,3 @@
+[submodule "zo-client"]
+	path = zo-client
+	url = git@github.com:01protocol/zo-client.git
