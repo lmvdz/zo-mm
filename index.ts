@@ -5,8 +5,9 @@ import { TpuClient } from "tpu-client";
 import { config } from "dotenv";
 import { createProgram, createProvider, FundingInfo, IDL, OrderType, Zo } from "@zero_one/client";
 import { fork, ChildProcess } from 'child_process'
-import { Spreads, Spread } from "./tardis";
+import { Spreads, Spread, Pairs, marketMap } from "./tardis";
 import * as anchor from "@project-serum/anchor";
+import Decimal from "decimal.js";
 
 config({path: './.env.local'});
 
@@ -70,6 +71,13 @@ try {
 const botWallet = new Wallet(keypair);
 
 
+const ACTIVE_MARKETS_DELIMITER = process.env.ACTIVE_MARKETS_DELIMITER || ','
+const ACTIVE_MARKETS = process.env.ACTIVE_MARKETS.split(ACTIVE_MARKETS_DELIMITER) || ["BTC"];
+const MAX_LOSS = process.env.MAX_LOSS || 0.25;
+const MAX_GAIN = process.env.MAX_GAIN || 0.25;
+const CANCEL_ORDER_INTERVAL_SECONDS = Number.parseFloat(process.env.CANCEL_ORDER_INTERVAL_SECONDS) || 1;
+const MARKET_REBALANCE_TIMEOUT_SECONDS = Number.parseFloat(process.env.MARKET_REBALANCE_TIMEOUT_SECONDS) || 2;
+const SPREAD_PERCENTAGE = Number.parseFloat(process.env.MM_SPREAD_PERCENTAGE) || 0.1
 interface Order {
     orderId: anchor.BN;
     controlAddress: PublicKey;
@@ -97,11 +105,14 @@ class MarketMaker {
     state: zo.State
     margin: zo.Margin
     running: boolean
-    spreads: Spreads
-    spread: number
+
+    spreads: Pairs
+    mmSpreads: Map<string, number>
+    midPrices: Map<string, number>
     markets: Map<string, zo.ZoMarket>
     orderbooks: Map<string, Orderbook>
-    tardis: ChildProcess
+    tardis: Map<string, ChildProcess>
+    
 
     constructor(tpuClient: TpuClient, provider: anchor.Provider, idl: zo.Zo, program: anchor.Program<zo.Zo>, state: zo.State, margin: zo.Margin) {
         this.tpuClient = tpuClient;
@@ -111,75 +122,156 @@ class MarketMaker {
         this.state = state;
         this.margin = margin;
         this.running = false;
+
+        this.spreads = {}
+        this.midPrices = new Map<string, number>();
+        this.tardis = new Map<string, ChildProcess>();
+        this.mmSpreads = new Map<string, number>();
+        this.orderbooks = new Map<string, Orderbook>();
+        this.markets = new Map<string, zo.ZoMarket>();
+        
+
     }
 
     static async load() {
+
         const tpuClient = await TpuClient.load(new Connection(process.env.RPC_URL));
         const provider = createProvider( tpuClient.connection, botWallet, { commitment: 'processed' } );
         const program = createProgram(provider, zo.Cluster.Mainnet);
-        const state = await (zo.State).load(program, zo.ZO_MAINNET_STATE_KEY) as zo.State;
+        const state = await zo.State.load(program, zo.ZO_MAINNET_STATE_KEY) as zo.State;
         const margin = await zo.Margin.load(program, state) as zo.Margin;
 
         return new MarketMaker(tpuClient, provider, zo.IDL, program, state, margin);
     }
 
 
-    public startTardis() {
-        if(!this.tardis)
-        this.tardis = fork('./tardis.ts', [], { stdio: ['pipe', 'pipe', 'pipe', 'ipc']})
-        
-        if(this.tardis.stderr)
-        this.tardis.stderr.on('data', (data : Buffer) => {
-            console.log(data.toString());
-        })
+    public async startTardis() {
+        [...this.markets.keys()].map(market => market.split('-')[0]).forEach(market => {
+            if(!this.tardis.has(market)) {
+                const tardis = fork('./tardis.ts', [market], { stdio: ['pipe', 'pipe', 'pipe', 'ipc']})
+                this.tardis.set(market, tardis);
+                if(tardis.stderr)
+                tardis.stderr.on('data', (data : Buffer) => {
+                    console.log(data.toString());
+                })
 
-        this.tardis.on('close', (code, sig) => {
-            this.tardis.kill();
-            delete this.tardis
-            this.startTardis();
-        })
+                tardis.on('close', (code, sig) => {
+                    console.log('tardis died');
+                    tardis.kill();
+                    this.tardis.delete(market);
+                    this.startTardis();
+                })
 
-        if(this.tardis.stdout)
-        this.tardis.stdout.on('data', (data: Buffer) => {
-            console.log(data.toString());
-        })
+                if(tardis.stdout)
+                tardis.stdout.on('data', (data: Buffer) => {
+                    console.log(data.toString());
+                })
 
-        this.tardis.on('message', (data : string) => {
-            let d = JSON.parse(data);
-            switch(d.type) {
-              case 'started':
-                  break;
-              case 'data':
-                  break;
-              case 'spreads':
-                  this.spreads = d.spreads as Spreads;
-                  console.log(this.spreads);
-                  break;
-              case 'error':
-                  console.error(d.data);
-                  break;
+                tardis.on('message', (data : string) => {
+                    let d = JSON.parse(data);
+                    switch(d.type) {
+                    case 'started':
+                        break;
+                    case 'data':
+                        break;
+                    case 'spreads':
+                        this.spreads[d.pair] = d.spreads as Spreads;
+                        this.midPrices.set(d.pair, Object.keys(d.spreads).map(key => d.spreads[key]).reduce((midPrice, exchange) => midPrice !== 0 ? ((midPrice  + (exchange.bestBid.price + (0.5 * exchange.spread))) * 0.5) : exchange.bestBid.price + (0.5 * exchange.spread), 0));
+                        break;
+                    case 'error':
+                        console.error(d.data);
+                        break;
+                    }
+                })
             }
         })
     }
-
-    public stop() {
-        this.running = false;
-    }
-
-    public start() {
-        this.running = true;
-    }
     
-    public setSpread(spread: number) {
-        this.spread = spread;
+    public setSpread(market: string, spread: number) {
+        this.mmSpreads.set(market, spread);
     }
 
     public rebalance() {
+        // reload positions
+        this.margin.loadPositions();
+        this.state.loadMarkets();
+        this.margin.loadBalances();
+        this.margin.loadOrders();
+        // loop over markets
+        [...this.markets.keys()].forEach((market, index) => {
+            console.log(market);
+            setTimeout(async () => {
+                // get the market maker's orders
+                const orders = await this.loadMarketMakerOrdersForMarket(market)
+                // cancel each order
+                await Promise.allSettled(orders.map((order, index) => {
+                    return new Promise((resolve, reject) => {
+                        try {
+                            setTimeout(() => {
+                                console.log('cancelling order ' + order.orderId);
+                                this.cancel(market, order).then((tx) => {
+                                    console.log("cancelled order " + order.orderId);
+                                    resolve(tx)
+                                }).catch(error => {
+                                    reject(error);
+                                })
+                            }, 1000 * index * CANCEL_ORDER_INTERVAL_SECONDS)
+                        } catch(error) {
+                            reject(error);
+                        }
+                    })
+                }))
+                // close open position if +/- uPNL gte absolute value of MAX_GAIN_LOSS_PERCENT
+                const positionInfo = this.margin.position(market)
+                if (positionInfo && !positionInfo.coins.dec.eq(new Decimal(0)) && !positionInfo.pCoins.dec.eq(new Decimal(0))) {
+                    const entry = positionInfo.coins.decimal.div(positionInfo.pCoins.dec);
+                    const pnl = this.margin.positionPnL(positionInfo);
+                    const GAIN = entry.add(entry.mul(new Decimal(MAX_GAIN)))
+                    const LOSS = entry.sub(entry.mul(new Decimal(MAX_LOSS)))
+                    if (pnl.gte(GAIN) || pnl.lte(LOSS.mul(new Decimal(-1)))) {
+                        try {
+                            await this.close(positionInfo);
+                        } catch(error) {
+                            console.error(error);
+                        }
+                    } else {
+                        console.log(positionInfo.marketKey, pnl)
+                    }
+                }
+                // open orders using tardis based mark price as mid price
 
-    }
-
-    public log() {
-
+                const base = market.split('-PERP')[0];
+                if (this.midPrices.has(base)) {
+                    const midPrice = this.midPrices.get(base);
+                    const spread = (midPrice*SPREAD_PERCENTAGE);
+                    const marketBySymbol = (await this.state.getMarketBySymbol(market));
+                    const marketInfo = this.state.markets[market];
+                    const maxQuote = this.margin.balances['USDC'].div(ACTIVE_MARKETS.length).div(2).number;
+                    const size = ((marketBySymbol.quoteSizeNumberToLots(maxQuote).toNumber() / marketBySymbol.priceNumberToLots(marketInfo.markPrice.number).toNumber())) / ( 10 ** (marketInfo.assetDecimals - marketInfo.assetLotSize))
+                    try {
+                        this.long(market, { limit: {} },  (midPrice - (spread/2)), size).then((tx) => {
+                            console.log('opened long ' + tx)
+                        }).catch(error => {
+                            console.error(error);
+                        })
+                        this.short(market, { limit: {} },  (midPrice + (spread/2)), size).then((tx) => {
+                            console.log('opened short ' + tx)
+                        }).catch(error => {
+                            console.error(error);
+                        })
+                    } catch(error) {
+                        console.error(error);
+                    }
+                    
+                } else {
+                    console.log('no price found for base ' + base);
+                }
+            }, 1000 * index * MARKET_REBALANCE_TIMEOUT_SECONDS)
+            
+            
+            
+        })
+        // recalculate long/short positions based on latest midPrice from tardis
     }
 
     public async loadMarket(symbol: string) : Promise<zo.ZoMarket> {
@@ -195,7 +287,7 @@ class MarketMaker {
         return market;
     }
 
-    public async loadMarketMakerOrderForMarket(symbol: string) : Promise<Array<Order>>{
+    public async loadMarketMakerOrdersForMarket(symbol: string) : Promise<Array<Order>>{
         
         this.loadMarket(symbol);
         const market = this.markets.get(symbol);
@@ -206,19 +298,15 @@ class MarketMaker {
         
     }
 
-    public async fetchOrderBook(symbol: string) : Promise<Orderbook> {
-        this.loadMarket(symbol);
-        const market = this.markets.get(symbol);
-        if (!market) throw new Error("Invalid Market Symbol");
-        const [asks, bids] = [ await market.loadAsks(this.tpuClient.connection), await market.loadBids(this.tpuClient.connection) ];
-        const orderbook = { asks, bids } as Orderbook;
-        this.orderbooks.set(symbol, orderbook);
-        return orderbook;
-    }
-
-    public async fetchFunding(symbol: string) : Promise<FundingInfo> {
-        return this.state.getFundingInfo(symbol)
-    }
+    // public async fetchOrderBook(symbol: string) : Promise<Orderbook> {
+    //     this.loadMarket(symbol);
+    //     const market = this.markets.get(symbol);
+    //     if (!market) throw new Error("Invalid Market Symbol");
+    //     const [asks, bids] = [ await market.loadAsks(this.tpuClient.connection), await market.loadBids(this.tpuClient.connection) ];
+    //     const orderbook = { asks, bids } as Orderbook;
+    //     this.orderbooks.set(symbol, orderbook);
+    //     return orderbook;
+    // }
 
     public async deposit(size: number, mint: PublicKey = zo.USDC_MAINNET_MINT_ADDRESS) : Promise<string> {
         return await this.margin.deposit(mint, size, false);
@@ -237,9 +325,10 @@ class MarketMaker {
     }
 
     public async close(position: zo.PositionInfo) {
-        const market = Object.keys(this.state.markets).map(key => this.state.markets[key]).find(market => market.pubKey.toBase58() === position.marketKey)
-        if (!market) throw new Error("invalid market key")
-        return await this[position.isLong ? 'short' : 'long'](market.symbol, { limit: {} } as OrderType, market.markPrice.number, position.coins.number)
+        const market = this.state.markets[position.marketKey]
+        if (!market) throw new Error("invalid market key");
+        console.log('attempting to close position');
+        return await this[position.isLong ? 'short' : 'long'](market.symbol, { limit: {} } as OrderType, market.markPrice.number, position.coins.number);
     }
 
     public async cancel(symbol: string, order: Order) : Promise<string> {
@@ -250,14 +339,30 @@ class MarketMaker {
         return await this.margin.settleFunds(symbol);
     }
 
-    public async getMarketSymbols() : Promise<Array<string>> {
-        return Object.keys(this.state.markets).map(key => this.state.markets[key].symbol)
-    }
-
 }
 
+const rebalanceIntervalInSeconds = Number.parseFloat(process.env.REBALANCE_INTERVAL) || 30
+
+
 MarketMaker.load().then(marketMaker => {
-    marketMaker.startTardis();
+    
+    console.log(ACTIVE_MARKETS);
+
+    // load markets
+    Promise.allSettled(ACTIVE_MARKETS.map(async marketToMake => {
+        return marketMaker.loadMarket(marketToMake + '-PERP')
+    })).then(() => {
+
+        // start the process for streaming market prices from CEXs for all loaded markets
+        marketMaker.startTardis();
+
+        // rebalance the market maker every X seconds
+        setInterval(() => {
+            marketMaker.rebalance();
+        }, 1000 * (rebalanceIntervalInSeconds > 0 ? rebalanceIntervalInSeconds : 1))
+
+        process.stdout.write('Market Maker has started!\n');
+    })
 });
 
 
