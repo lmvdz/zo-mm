@@ -1,0 +1,16 @@
+{
+  "name": "zo-mm",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@zero_one/client": "file:zo-client",
+    "dotenv": "^16.0.0",
+    "tpu-client": "^1.0.4"
+  }
+}
