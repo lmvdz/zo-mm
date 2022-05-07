@@ -1,12 +1,12 @@
 // Setup provider (see anchor docs for more instructions on setting up a provider using your wallet)
-import * as anchor from "@project-serum/anchor";
-import * as zo from "@zero_one/client";
-import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { default as zo } from "@zero_one/client";
+import { ConfirmOptions, Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import { TpuClient } from "tpu-client";
 import { config } from "dotenv";
-import { Program } from "@project-serum/anchor";
-import { FundingInfo, OrderType } from "@zero_one/client";
-
+import { createProgram, createProvider, FundingInfo, IDL, OrderType, Zo } from "@zero_one/client";
+import { fork, ChildProcess } from 'child_process'
+import { Spreads, Spread } from "./tardis";
+import * as anchor from "@project-serum/anchor";
 
 config({path: './.env.local'});
 
@@ -29,12 +29,25 @@ export interface IWallet {
     publicKey: PublicKey;
 }
 
-export declare class Wallet implements IWallet {
+class Wallet {
     readonly payer: Keypair;
-    constructor(payer: Keypair);
-    signTransaction(tx: Transaction): Promise<Transaction>;
-    signAllTransactions(txs: Transaction[]): Promise<Transaction[]>;
-    get publicKey(): PublicKey;
+
+    constructor(payer) {
+        this.payer = payer;
+    }
+    async signTransaction(tx: Transaction) {
+        tx.partialSign(this.payer);
+        return tx;
+    }
+    async signAllTransactions(txs: Array<Transaction>) {
+        return txs.map((t) => { 
+            t.partialSign(this.payer);
+            return t;
+        });
+    }
+    get publicKey() {
+        return this.payer.publicKey;
+    }
 }
 
 // setup wallet
@@ -80,15 +93,17 @@ class MarketMaker {
     tpuClient: TpuClient
     provider: anchor.Provider
     idl: zo.Zo
-    program: Program<zo.Zo>
+    program: anchor.Program<zo.Zo>
     state: zo.State
     margin: zo.Margin
     running: boolean
+    spreads: Spreads
     spread: number
     markets: Map<string, zo.ZoMarket>
     orderbooks: Map<string, Orderbook>
+    tardis: ChildProcess
 
-    constructor(tpuClient: TpuClient, provider: anchor.Provider, idl: zo.Zo, program: Program<zo.Zo>, state: zo.State, margin: zo.Margin) {
+    constructor(tpuClient: TpuClient, provider: anchor.Provider, idl: zo.Zo, program: anchor.Program<zo.Zo>, state: zo.State, margin: zo.Margin) {
         this.tpuClient = tpuClient;
         this.provider = provider;
         this.idl = idl;
@@ -100,16 +115,52 @@ class MarketMaker {
 
     static async load() {
         const tpuClient = await TpuClient.load(new Connection(process.env.RPC_URL));
-        const provider = new anchor.Provider( tpuClient.connection, botWallet, { commitment: 'processed' } );
-        const idl = await anchor.Program.fetchIdl(new PublicKey(zo.ZERO_ONE_MAINNET_PROGRAM_ID), provider) as zo.Zo;
-        const program = new anchor.Program(idl, zo.ZERO_ONE_MAINNET_PROGRAM_ID, provider) as Program<zo.Zo>; 
-        const state = await zo.State.load(program, zo.ZO_MAINNET_STATE_KEY) as zo.State;
-        const margin = await zo.Margin.create(program, state) as zo.Margin;
+        const provider = createProvider( tpuClient.connection, botWallet, { commitment: 'processed' } );
+        const program = createProgram(provider, zo.Cluster.Mainnet);
+        const state = await (zo.State).load(program, zo.ZO_MAINNET_STATE_KEY) as zo.State;
+        const margin = await zo.Margin.load(program, state) as zo.Margin;
 
-        return new MarketMaker(tpuClient, provider, idl, program, state, margin);
+        return new MarketMaker(tpuClient, provider, zo.IDL, program, state, margin);
     }
 
 
+    public startTardis() {
+        if(!this.tardis)
+        this.tardis = fork('./tardis.ts', [], { stdio: ['pipe', 'pipe', 'pipe', 'ipc']})
+        
+        if(this.tardis.stderr)
+        this.tardis.stderr.on('data', (data : Buffer) => {
+            console.log(data.toString());
+        })
+
+        this.tardis.on('close', (code, sig) => {
+            this.tardis.kill();
+            delete this.tardis
+            this.startTardis();
+        })
+
+        if(this.tardis.stdout)
+        this.tardis.stdout.on('data', (data: Buffer) => {
+            console.log(data.toString());
+        })
+
+        this.tardis.on('message', (data : string) => {
+            let d = JSON.parse(data);
+            switch(d.type) {
+              case 'started':
+                  break;
+              case 'data':
+                  break;
+              case 'spreads':
+                  this.spreads = d.spreads as Spreads;
+                  console.log(this.spreads);
+                  break;
+              case 'error':
+                  console.error(d.data);
+                  break;
+            }
+        })
+    }
 
     public stop() {
         this.running = false;
@@ -205,5 +256,8 @@ class MarketMaker {
 
 }
 
+MarketMaker.load().then(marketMaker => {
+    marketMaker.startTardis();
+});
 
 

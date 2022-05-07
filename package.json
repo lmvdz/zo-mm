@@ -2,15 +2,25 @@
   "name": "zo-mm",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "type": "module",
+  "exports": [
+    "./index.ts",
+    "./tardis.ts"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node --loader ts-node/esm ./index.ts"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@solana/web3.js": "^1.41.4",
     "@zero_one/client": "file:zo-client",
     "dotenv": "^16.0.0",
-    "tpu-client": "^1.0.4"
+    "tardis-dev": "^13.2.0",
+    "tpu-client": "^1.0.4",
+    "ts-node": "^10.7.0"
+  },
+  "devDependencies": {
+    "typescript": "^4.6.4"
   }
 }
