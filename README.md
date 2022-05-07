@@ -34,7 +34,7 @@ ACTIVE_MARKETS_DELIMITER=,
 # the pairs which the bot should act on ( BTC,ETH,SOL,LUNA,AVAX,APE,NEAR,GMT )
 ACTIVE_MARKETS=BTC,ETH
 
-# how often the bot should cancel open orders and open fresh orders using the MM_SPREAD_PERCENTAGE to determine the distance from mark price
+# how often in seconds the bot should cancel open orders and open fresh orders using the MM_SPREAD_PERCENTAGE to determine the distance from mark price
 REBALANCE_INTERVAL=60
 
 # the total distance from short to long with mark price residing in the middle
