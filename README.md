@@ -1,4 +1,4 @@
-# ZeroOne Perp DEX Market Making Bot  
+# 01.xyz Perp DEX Market Making Bot  
 
 > Should be easily configurable by anyone, plug and play  
 > Should place both ask and bid orders around some mid price  
